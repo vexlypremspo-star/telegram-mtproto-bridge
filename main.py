@@ -10,6 +10,34 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 from telethon import TelegramClient, functions, types, utils
+
+# Safety lock: TeleRelay is a forwarding/read-only bridge and must never
+# execute Telegram APIs that delete message history or messages.
+_BLOCKED_TELEGRAM_REQUESTS = {
+    "DeleteHistoryRequest",
+    "DeleteMessagesRequest",
+    "DeleteChatUserRequest",
+    "DeleteTopicHistoryRequest",
+    "DeleteSavedHistoryRequest",
+    "DeleteUserHistoryRequest",
+    "DeleteParticipantHistoryRequest",
+    "DiscardEncryptionRequest",
+}
+
+class SafeTelegramClient(TelegramClient):
+    async def __call__(self, request, *args, **kwargs):
+        request_name = request.__class__.__name__
+        if request_name in _BLOCKED_TELEGRAM_REQUESTS:
+            raise RuntimeError(
+                f"Blocked Telegram deletion operation: {request_name}"
+            )
+        return await super().__call__(request, *args, **kwargs)
+
+    async def delete_messages(self, *args, **kwargs):
+        raise RuntimeError("Blocked Telegram deletion operation: delete_messages")
+
+    async def delete_dialog(self, *args, **kwargs):
+        raise RuntimeError("Blocked Telegram deletion operation: delete_dialog")
 from telethon.sessions import StringSession
 
 load_dotenv()
@@ -183,7 +211,7 @@ async def get_client(user_id: str):
 
     client = clients.get(user_id)
     if client is None:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        client = SafeTelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
         clients[user_id] = client
 
