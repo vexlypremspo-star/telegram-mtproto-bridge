@@ -482,16 +482,25 @@ async def get_folders(user_id: str, x_api_key: str | None = Header(default=None)
 async def get_chats(
     user_id: str,
     folder_id: int | None = None,
+    limit: int | None = None,
     x_api_key: str | None = Header(default=None),
 ):
     check_api_key(x_api_key)
     client = await get_client(user_id)
 
+    requested_limit = None if limit is None else max(1, min(limit, 200))
+
     if folder_id is not None:
         if folder_id == 1:
-            dialogs = [dialog async for dialog in client.iter_dialogs(folder=1, limit=None)]
+            dialogs = [
+                dialog
+                async for dialog in client.iter_dialogs(folder=1, limit=requested_limit)
+            ]
         elif folder_id == 0:
-            dialogs = [dialog async for dialog in client.iter_dialogs(folder=0, limit=None)]
+            dialogs = [
+                dialog
+                async for dialog in client.iter_dialogs(folder=0, limit=requested_limit)
+            ]
         else:
             result = await client(functions.messages.GetDialogFiltersRequest())
             dialog_filter = next(
@@ -506,15 +515,19 @@ async def get_chats(
             if dialog_filter is None:
                 raise HTTPException(status_code=404, detail="Telegram folder not found")
 
-            dialogs = [
-                dialog
-                async for dialog in client.iter_dialogs()
-                if _dialog_matches_folder(dialog, dialog_filter)
-            ]
+            dialogs = []
+            async for dialog in client.iter_dialogs(limit=None):
+                if _dialog_matches_folder(dialog, dialog_filter):
+                    dialogs.append(dialog)
+                    if requested_limit is not None and len(dialogs) >= requested_limit:
+                        break
     else:
-        dialogs = [dialog async for dialog in client.iter_dialogs(limit=None)]
+        dialogs = [
+            dialog
+            async for dialog in client.iter_dialogs(limit=requested_limit)
+        ]
 
-    if limit is not None:\n        limit = max(1, min(limit, 200))\n        dialogs = dialogs[:limit]\n\n    return {"chats": [_chat_payload(dialog) for dialog in dialogs]}
+    return {"chats": [_chat_payload(dialog) for dialog in dialogs]}
 
 
 @app.get("/telegram/chats/{chat_id}/messages")
