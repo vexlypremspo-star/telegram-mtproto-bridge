@@ -189,6 +189,7 @@ async def login_2fa(request: TwoFactorVerify, x_api_key: str | None = Header(def
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
+    _save_sessions()
     return {"status": "connected"}
 
 
@@ -412,6 +413,6 @@ async def logout(user_id: str, x_api_key: str | None = Header(default=None)):
     if client:
         await client.log_out()
 
-sessions.pop(user_id, None)
+    sessions.pop(user_id, None)
     _save_sessions()
     return {"status": "logged_out"}
