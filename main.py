@@ -30,6 +30,7 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_S
 
 sessions: Dict[str, str] = {}
 clients: Dict[str, TelegramClient] = {}
+pending_logins: Dict[str, dict] = {}
 github_file_sha: str | None = None
 
 
@@ -80,11 +81,23 @@ def _load_sessions() -> None:
         encrypted_bundle = base64.b64decode(encoded).decode("utf-8")
         decrypted_bundle = cipher.decrypt(encrypted_bundle.encode()).decode("utf-8")
         data = json.loads(decrypted_bundle)
-        sessions = {
-            str(user_id): str(value)
-            for user_id, value in data.items()
-            if isinstance(value, str) and value
-        } if isinstance(data, dict) else {}
+        if isinstance(data, dict) and "sessions" in data:
+            raw_sessions = data.get("sessions", {})
+            raw_pending = data.get("pending_logins", {})
+            sessions = {
+                str(user_id): str(value)
+                for user_id, value in raw_sessions.items()
+                if isinstance(value, str) and value
+            } if isinstance(raw_sessions, dict) else {}
+            pending_logins = raw_pending if isinstance(raw_pending, dict) else {}
+        else:
+            # Backward compatibility with the previous sessions-only format.
+            sessions = {
+                str(user_id): str(value)
+                for user_id, value in data.items()
+                if isinstance(value, str) and value
+            } if isinstance(data, dict) else {}
+            pending_logins = {}
     except Exception:
         sessions = {}
 
@@ -95,7 +108,10 @@ def _save_sessions() -> None:
     if not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_TOKEN is not configured")
 
-    bundle = json.dumps(sessions, separators=(",", ":")).encode("utf-8")
+    bundle = json.dumps(
+        {"sessions": sessions, "pending_logins": pending_logins},
+        separators=(",", ":"),
+    ).encode("utf-8")
     encrypted_bundle = cipher.encrypt(bundle).decode("utf-8")
     encoded = base64.b64encode(encrypted_bundle.encode("utf-8")).decode("ascii")
 
@@ -190,6 +206,12 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
 
     sent = await client.send_code_request(request.phone)
     clients[request.user_id] = client
+    pending_logins[request.user_id] = {
+        "session_string": client.session.save(),
+        "phone": request.phone,
+        "phone_code_hash": sent.phone_code_hash,
+    }
+    _save_sessions()
 
     return {"status": "code_sent", "phone_code_hash": sent.phone_code_hash}
 
@@ -199,18 +221,40 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
     check_api_key(x_api_key)
 
     client = clients.get(request.user_id)
+    pending = pending_logins.get(request.user_id)
+
+    if client is None and pending:
+        session_string = pending.get("session_string")
+        if session_string:
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            await client.connect()
+            clients[request.user_id] = client
+
     if client is None:
         raise HTTPException(status_code=404, detail="Login session not found")
 
     try:
-        await client.sign_in(code=request.code)
+        phone_code_hash = pending.get("phone_code_hash") if pending else None
+        if phone_code_hash:
+            await client.sign_in(
+                code=request.code,
+                phone_code_hash=phone_code_hash,
+                phone=pending.get("phone"),
+            )
+        else:
+            await client.sign_in(code=request.code)
     except Exception as error:
         if error.__class__.__name__ == "SessionPasswordNeededError":
+            if pending:
+                pending["session_string"] = client.session.save()
+                pending_logins[request.user_id] = pending
+                _save_sessions()
             return {"status": "2fa_required"}
         raise HTTPException(status_code=400, detail=error.__class__.__name__)
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
+    pending_logins.pop(request.user_id, None)
     _save_sessions()
     return {"status": "connected"}
 
@@ -227,6 +271,7 @@ async def login_2fa(request: TwoFactorVerify, x_api_key: str | None = Header(def
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
+    pending_logins.pop(request.user_id, None)
     _save_sessions()
     return {"status": "connected"}
 
