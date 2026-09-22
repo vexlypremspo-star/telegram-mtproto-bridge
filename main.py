@@ -21,8 +21,6 @@ cipher = Fernet(os.environ["SESSION_ENCRYPTION_KEY"].encode())
 
 app = FastAPI(title="Telegram MTProto Bridge")
 
-# Free session persistence: store one encrypted session bundle in a private GitHub
-# repository instead of using Render's paid Persistent Disk.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "vexlypremspo-star/telegram-mtproto-bridge")
 GITHUB_SESSION_PATH = os.environ.get("GITHUB_SESSION_PATH", "telegram_sessions.enc")
@@ -63,12 +61,15 @@ def _load_sessions() -> None:
 
     if not GITHUB_TOKEN:
         sessions = {}
+        pending_logins = {}
+        github_file_sha = None
         return
 
     try:
         result = _github_request("GET", GITHUB_API_URL)
         if not result:
             sessions = {}
+            pending_logins = {}
             github_file_sha = None
             return
 
@@ -76,11 +77,13 @@ def _load_sessions() -> None:
         encoded = result.get("content", "").replace("\n", "")
         if not encoded:
             sessions = {}
+            pending_logins = {}
             return
 
         encrypted_bundle = base64.b64decode(encoded).decode("utf-8")
         decrypted_bundle = cipher.decrypt(encrypted_bundle.encode()).decode("utf-8")
         data = json.loads(decrypted_bundle)
+
         if isinstance(data, dict) and "sessions" in data:
             raw_sessions = data.get("sessions", {})
             raw_pending = data.get("pending_logins", {})
@@ -91,7 +94,6 @@ def _load_sessions() -> None:
             } if isinstance(raw_sessions, dict) else {}
             pending_logins = raw_pending if isinstance(raw_pending, dict) else {}
         else:
-            # Backward compatibility with the previous sessions-only format.
             sessions = {
                 str(user_id): str(value)
                 for user_id, value in data.items()
@@ -100,6 +102,8 @@ def _load_sessions() -> None:
             pending_logins = {}
     except Exception:
         sessions = {}
+        pending_logins = {}
+        github_file_sha = None
 
 
 def _save_sessions() -> None:
@@ -128,6 +132,13 @@ def _save_sessions() -> None:
         json.dumps(payload).encode("utf-8"),
     )
     github_file_sha = result.get("content", {}).get("sha") if result else github_file_sha
+
+
+def _save_sessions_safely() -> None:
+    try:
+        _save_sessions()
+    except Exception as error:
+        print(f"WARNING: Could not persist Telegram session data: {error}", flush=True)
 
 
 _load_sessions()
@@ -169,8 +180,8 @@ async def get_client(user_id: str):
         session_string = cipher.decrypt(encrypted_session.encode()).decode()
     except Exception:
         raise HTTPException(status_code=500, detail="Stored Telegram session could not be decrypted")
-    client = clients.get(user_id)
 
+    client = clients.get(user_id)
     if client is None:
         client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
@@ -199,21 +210,31 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
                 return {"status": "already_connected"}
         except Exception:
             sessions.pop(request.user_id, None)
-            _save_sessions()
+            _save_sessions_safely()
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
 
-    sent = await client.send_code_request(request.phone)
+    try:
+        sent = await client.send_code_request(request.phone)
+    except Exception as error:
+        await client.disconnect()
+        raise HTTPException(status_code=400, detail=error.__class__.__name__)
+
     clients[request.user_id] = client
     pending_logins[request.user_id] = {
         "session_string": client.session.save(),
         "phone": request.phone,
         "phone_code_hash": sent.phone_code_hash,
     }
-    _save_sessions()
 
-    return {"status": "code_sent", "phone_code_hash": sent.phone_code_hash}
+    # Telegram code delivery must not fail just because GitHub persistence fails.
+    _save_sessions_safely()
+
+    return {
+        "status": "code_sent",
+        "phone_code_hash": sent.phone_code_hash,
+    }
 
 
 @app.post("/telegram/login/verify")
@@ -231,7 +252,10 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
             clients[request.user_id] = client
 
     if client is None:
-        raise HTTPException(status_code=404, detail="Login session not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Login session not found. Request a new Telegram login code.",
+        )
 
     try:
         phone_code_hash = pending.get("phone_code_hash") if pending else None
@@ -248,14 +272,15 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
             if pending:
                 pending["session_string"] = client.session.save()
                 pending_logins[request.user_id] = pending
-                _save_sessions()
+                _save_sessions_safely()
             return {"status": "2fa_required"}
         raise HTTPException(status_code=400, detail=error.__class__.__name__)
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
     pending_logins.pop(request.user_id, None)
-    _save_sessions()
+    _save_sessions_safely()
+
     return {"status": "connected"}
 
 
@@ -264,15 +289,28 @@ async def login_2fa(request: TwoFactorVerify, x_api_key: str | None = Header(def
     check_api_key(x_api_key)
 
     client = clients.get(request.user_id)
+    pending = pending_logins.get(request.user_id)
+
+    if client is None and pending:
+        session_string = pending.get("session_string")
+        if session_string:
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            await client.connect()
+            clients[request.user_id] = client
+
     if client is None:
-        raise HTTPException(status_code=404, detail="Login session not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Login session not found. Request a new Telegram login code.",
+        )
 
     await client.sign_in(password=request.password)
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
     pending_logins.pop(request.user_id, None)
-    _save_sessions()
+    _save_sessions_safely()
+
     return {"status": "connected"}
 
 
@@ -497,5 +535,6 @@ async def logout(user_id: str, x_api_key: str | None = Header(default=None)):
         await client.log_out()
 
     sessions.pop(user_id, None)
-    _save_sessions()
+    pending_logins.pop(user_id, None)
+    _save_sessions_safely()
     return {"status": "logged_out"}
