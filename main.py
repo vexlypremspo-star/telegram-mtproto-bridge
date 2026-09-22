@@ -1,6 +1,8 @@
 import os
+import base64
 import json
-import tempfile
+import urllib.error
+import urllib.request
 from typing import Dict
 
 from fastapi import FastAPI, Header, HTTPException
@@ -19,61 +21,97 @@ cipher = Fernet(os.environ["SESSION_ENCRYPTION_KEY"].encode())
 
 app = FastAPI(title="Telegram MTProto Bridge")
 
-# Render persistent disks should be mounted at /data. Set SESSION_STORE_PATH
-# if a different persistent location is used.
-SESSION_STORE_PATH = os.environ.get("SESSION_STORE_PATH", "/data/telegram_sessions.json")
-LOCAL_SESSION_STORE_PATH = "/tmp/telegram_sessions.json"
+# Free session persistence: store one encrypted session bundle in a private GitHub
+# repository instead of using Render's paid Persistent Disk.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "vexlypremspo-star/telegram-mtproto-bridge")
+GITHUB_SESSION_PATH = os.environ.get("GITHUB_SESSION_PATH", "telegram_sessions.enc")
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_SESSION_PATH}"
 
-# Encrypted Telethon StringSession values are persisted to disk so a Render
-# restart/redeploy can recreate the TelegramClient without another login.
 sessions: Dict[str, str] = {}
 clients: Dict[str, TelegramClient] = {}
+github_file_sha: str | None = None
 
 
-def _session_store_path() -> str:
-    directory = os.path.dirname(SESSION_STORE_PATH)
-    if directory and os.path.isdir(directory):
-        return SESSION_STORE_PATH
-    return LOCAL_SESSION_STORE_PATH
+def _github_request(method: str, url: str, body: bytes | None = None):
+    if not GITHUB_TOKEN:
+        return None
+
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "telegram-mtproto-bridge",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
 
 
 def _load_sessions() -> None:
-    global sessions
-    path = _session_store_path()
+    global sessions, github_file_sha
+
+    if not GITHUB_TOKEN:
+        sessions = {}
+        return
+
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            data = json.load(file)
+        result = _github_request("GET", GITHUB_API_URL)
+        if not result:
+            sessions = {}
+            github_file_sha = None
+            return
+
+        github_file_sha = result.get("sha")
+        encoded = result.get("content", "").replace("\n", "")
+        if not encoded:
+            sessions = {}
+            return
+
+        encrypted_bundle = base64.b64decode(encoded).decode("utf-8")
+        decrypted_bundle = cipher.decrypt(encrypted_bundle.encode()).decode("utf-8")
+        data = json.loads(decrypted_bundle)
         sessions = {
             str(user_id): str(value)
             for user_id, value in data.items()
             if isinstance(value, str) and value
         } if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except Exception:
         sessions = {}
 
 
 def _save_sessions() -> None:
-    path = _session_store_path()
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    global github_file_sha
 
-    fd, temp_path = tempfile.mkstemp(
-        prefix=".telegram_sessions_",
-        suffix=".tmp",
-        dir=directory or None,
+    if not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_TOKEN is not configured")
+
+    bundle = json.dumps(sessions, separators=(",", ":")).encode("utf-8")
+    encrypted_bundle = cipher.encrypt(bundle).decode("utf-8")
+    encoded = base64.b64encode(encrypted_bundle.encode("utf-8")).decode("ascii")
+
+    payload = {
+        "message": "Update encrypted Telegram sessions",
+        "content": encoded,
+    }
+    if github_file_sha:
+        payload["sha"] = github_file_sha
+
+    result = _github_request(
+        "PUT",
+        GITHUB_API_URL,
+        json.dumps(payload).encode("utf-8"),
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            json.dump(sessions, file)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temp_path, path)
-    finally:
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
+    github_file_sha = result.get("content", {}).get("sha") if result else github_file_sha
 
 
 _load_sessions()
