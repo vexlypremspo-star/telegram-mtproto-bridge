@@ -289,13 +289,29 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
         else:
             await client.sign_in(code=request.code)
     except Exception as error:
+        # Telegram raises SessionPasswordNeededError only when the account
+        # requires a 2FA password. Accounts without 2FA finish login here.
         if error.__class__.__name__ == "SessionPasswordNeededError":
             if pending:
                 pending["session_string"] = client.session.save()
                 pending_logins[request.user_id] = pending
                 _save_sessions_safely()
             return {"status": "2fa_required"}
+
         raise HTTPException(status_code=400, detail=error.__class__.__name__)
+
+    # Confirm that the code-only login really produced an authorized session
+    # before persisting it. This path never calls log_out().
+    try:
+        if not await client.is_user_authorized():
+            raise HTTPException(
+                status_code=401,
+                detail="Telegram authorization was not completed",
+            )
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=error.__class__.__name__)
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
