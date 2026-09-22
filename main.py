@@ -59,7 +59,7 @@ def _github_request(method: str, url: str, body: bytes | None = None):
 
 
 def _load_sessions() -> None:
-    global sessions, github_file_sha
+    global sessions, pending_logins, github_file_sha
 
     if not GITHUB_TOKEN:
         sessions = {}
