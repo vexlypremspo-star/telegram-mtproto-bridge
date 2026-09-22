@@ -203,6 +203,10 @@ async def root():
 async def login_start(request: LoginStart, x_api_key: str | None = Header(default=None)):
     check_api_key(x_api_key)
 
+    # Never revoke an already-authorized Telegram session just because the
+    # user opens the login flow again. Re-authentication must be an explicit
+    # disconnect/reconnect action so the website cannot unexpectedly log out
+    # the user's Telegram account.
     if request.user_id in sessions:
         client = clients.get(request.user_id)
 
@@ -215,21 +219,17 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
         if client is not None:
             try:
                 if await client.is_user_authorized():
-                    # A login attempt from the app means the user wants a fresh
-                    # login code. Revoke the stale Telegram session first so
-                    # we do not get stuck returning "already_connected".
-                    try:
-                        await client.log_out()
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                    return {
+                        "status": "already_connected",
+                        "phone_code_hash": "",
+                    }
+            except Exception:
+                pass
 
-        sessions.pop(request.user_id, None)
+        # The stored session exists but is no longer authorized. It is safe
+        # to remove the stale local session and start a fresh login.
         clients.pop(request.user_id, None)
+        sessions.pop(request.user_id, None)
         pending_logins.pop(request.user_id, None)
         _save_sessions_safely()
 
