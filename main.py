@@ -38,6 +38,7 @@ class SafeTelegramClient(TelegramClient):
 
     async def delete_dialog(self, *args, **kwargs):
         raise RuntimeError("Blocked Telegram deletion operation: delete_dialog")
+
 from telethon.sessions import StringSession
 
 load_dotenv()
@@ -199,6 +200,16 @@ def check_api_key(api_key: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def _new_login_client(session_string: str | None = None) -> SafeTelegramClient:
+    # Every TeleRelay login gets its own independent StringSession.
+    # Never reuse a Telegram mobile/Desktop session file or authorization key.
+    return SafeTelegramClient(
+        StringSession(session_string or ""),
+        API_ID,
+        API_HASH,
+    )
+
+
 async def get_client(user_id: str):
     encrypted_session = sessions.get(user_id)
     if not encrypted_session:
@@ -211,7 +222,7 @@ async def get_client(user_id: str):
 
     client = clients.get(user_id)
     if client is None:
-        client = SafeTelegramClient(StringSession(session_string), API_ID, API_HASH)
+        client = _new_login_client(session_string)
         await client.connect()
         clients[user_id] = client
 
@@ -231,10 +242,8 @@ async def root():
 async def login_start(request: LoginStart, x_api_key: str | None = Header(default=None)):
     check_api_key(x_api_key)
 
-    # Never revoke an already-authorized Telegram session just because the
-    # user opens the login flow again. Re-authentication must be an explicit
-    # disconnect/reconnect action so the website cannot unexpectedly log out
-    # the user's Telegram account.
+    # An existing TeleRelay authorization must never be replaced merely by
+    # opening the login screen. This endpoint never calls log_out().
     if request.user_id in sessions:
         client = clients.get(request.user_id)
 
@@ -254,14 +263,16 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
             except Exception:
                 pass
 
-        # The stored session exists but is no longer authorized. It is safe
-        # to remove the stale local session and start a fresh login.
+        # The stored TeleRelay session is stale/unauthorized. Removing the
+        # local stored session does not revoke the user's Telegram phone session.
         clients.pop(request.user_id, None)
         sessions.pop(request.user_id, None)
         pending_logins.pop(request.user_id, None)
         _save_sessions_safely()
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    # IMPORTANT: create a fresh TeleRelay authorization session. This is
+    # independent from the Telegram app already logged in on the user's phone.
+    client = _new_login_client()
     await client.connect()
 
     try:
@@ -277,7 +288,6 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
         "phone_code_hash": sent.phone_code_hash,
     }
 
-    # Telegram code delivery must not fail just because GitHub persistence fails.
     _save_sessions_safely()
 
     return {
@@ -296,7 +306,7 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
     if client is None and pending:
         session_string = pending.get("session_string")
         if session_string:
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            client = _new_login_client(session_string)
             await client.connect()
             clients[request.user_id] = client
 
@@ -308,6 +318,10 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
 
     try:
         phone_code_hash = pending.get("phone_code_hash") if pending else None
+
+        # For both 2FA and non-2FA accounts, this is the only authorization
+        # call. It creates the TeleRelay session; it does not log out the
+        # Telegram mobile/Desktop session.
         if phone_code_hash:
             await client.sign_in(
                 code=request.code,
@@ -317,8 +331,6 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
         else:
             await client.sign_in(code=request.code)
     except Exception as error:
-        # Telegram raises SessionPasswordNeededError only when the account
-        # requires a 2FA password. Accounts without 2FA finish login here.
         if error.__class__.__name__ == "SessionPasswordNeededError":
             if pending:
                 pending["session_string"] = client.session.save()
@@ -328,13 +340,20 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
 
         raise HTTPException(status_code=400, detail=error.__class__.__name__)
 
-    # Confirm that the code-only login really produced an authorized session
-    # before persisting it. This path never calls log_out().
     try:
         if not await client.is_user_authorized():
             raise HTTPException(
                 status_code=401,
                 detail="Telegram authorization was not completed",
+            )
+
+        # Force Telegram to confirm the identity attached to this newly
+        # authorized session before we persist it.
+        me = await client.get_me()
+        if me is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Telegram did not return the logged-in user",
             )
     except HTTPException:
         raise
@@ -359,7 +378,7 @@ async def login_2fa(request: TwoFactorVerify, x_api_key: str | None = Header(def
     if client is None and pending:
         session_string = pending.get("session_string")
         if session_string:
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            client = _new_login_client(session_string)
             await client.connect()
             clients[request.user_id] = client
 
@@ -370,6 +389,12 @@ async def login_2fa(request: TwoFactorVerify, x_api_key: str | None = Header(def
         )
 
     await client.sign_in(password=request.password)
+
+    if not await client.is_user_authorized():
+        raise HTTPException(
+            status_code=401,
+            detail="Telegram 2FA authorization was not completed",
+        )
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
