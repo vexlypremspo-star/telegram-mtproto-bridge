@@ -432,6 +432,28 @@ def _chat_payload(dialog) -> dict:
     }
 
 
+@app.get("/telegram/status")
+async def telegram_status(user_id: str, x_api_key: str | None = Header(default=None)):
+    check_api_key(x_api_key)
+
+    if user_id not in sessions:
+        return {"connected": False}
+
+    try:
+        client = await get_client(user_id)
+        if not await client.is_user_authorized():
+            return {"connected": False}
+
+        me = await client.get_me()
+        return {
+            "connected": True,
+            "telegram_user_id": str(me.id),
+            "telegram_username": getattr(me, "username", None),
+        }
+    except Exception:
+        return {"connected": False}
+
+
 @app.get("/telegram/folders")
 async def get_folders(user_id: str, x_api_key: str | None = Header(default=None)):
     check_api_key(x_api_key)
