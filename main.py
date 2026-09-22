@@ -204,13 +204,34 @@ async def login_start(request: LoginStart, x_api_key: str | None = Header(defaul
     check_api_key(x_api_key)
 
     if request.user_id in sessions:
-        try:
-            client = await get_client(request.user_id)
-            if await client.is_user_authorized():
-                return {"status": "already_connected"}
-        except Exception:
-            sessions.pop(request.user_id, None)
-            _save_sessions_safely()
+        client = clients.get(request.user_id)
+
+        if client is None:
+            try:
+                client = await get_client(request.user_id)
+            except Exception:
+                client = None
+
+        if client is not None:
+            try:
+                if await client.is_user_authorized():
+                    # A login attempt from the app means the user wants a fresh
+                    # login code. Revoke the stale Telegram session first so
+                    # we do not get stuck returning "already_connected".
+                    try:
+                        await client.log_out()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+        sessions.pop(request.user_id, None)
+        clients.pop(request.user_id, None)
+        pending_logins.pop(request.user_id, None)
+        _save_sessions_safely()
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
