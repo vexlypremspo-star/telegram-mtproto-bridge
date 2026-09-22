@@ -514,7 +514,7 @@ async def get_chats(
     else:
         dialogs = [dialog async for dialog in client.iter_dialogs(limit=None)]
 
-    return {"chats": [_chat_payload(dialog) for dialog in dialogs]}
+    if limit is not None:\n        limit = max(1, min(limit, 200))\n        dialogs = dialogs[:limit]\n\n    return {"chats": [_chat_payload(dialog) for dialog in dialogs]}
 
 
 @app.get("/telegram/chats/{chat_id}/messages")
