@@ -191,11 +191,28 @@ def _dialog_matches_folder(dialog, dialog_filter) -> bool:
 
 
 def _chat_payload(dialog) -> dict:
+    entity = dialog.entity
+    is_channel = bool(dialog.is_channel)
+    is_broadcast = bool(is_channel and getattr(entity, "broadcast", False))
+
+    if is_broadcast:
+        chat_type = "channel"
+    elif bool(dialog.is_group) or is_channel:
+        chat_type = "group"
+    else:
+        chat_type = "private"
+
     return {
         "id": dialog.id,
         "name": dialog.name,
+        "title": getattr(entity, "title", None) or dialog.name,
+        "username": getattr(entity, "username", None),
+        "first_name": getattr(entity, "first_name", None),
+        "last_name": getattr(entity, "last_name", None),
         "is_group": bool(dialog.is_group),
-        "is_channel": bool(dialog.is_channel),
+        "is_channel": is_channel,
+        "type": chat_type,
+        "memberCount": int(getattr(entity, "participants_count", 0) or 0),
     }
 
 
@@ -234,9 +251,9 @@ async def get_chats(
 
     if folder_id is not None:
         if folder_id == 1:
-            dialogs = [dialog async for dialog in client.iter_dialogs(folder=1)]
+            dialogs = [dialog async for dialog in client.iter_dialogs(folder=1, limit=None)]
         elif folder_id == 0:
-            dialogs = [dialog async for dialog in client.iter_dialogs(folder=0)]
+            dialogs = [dialog async for dialog in client.iter_dialogs(folder=0, limit=None)]
         else:
             result = await client(functions.messages.GetDialogFiltersRequest())
             dialog_filter = next(
@@ -257,7 +274,7 @@ async def get_chats(
                 if _dialog_matches_folder(dialog, dialog_filter)
             ]
     else:
-        dialogs = [dialog async for dialog in client.iter_dialogs()]
+        dialogs = [dialog async for dialog in client.iter_dialogs(limit=None)]
 
     return {"chats": [_chat_payload(dialog) for dialog in dialogs]}
 
