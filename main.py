@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 from typing import Dict
 
 from fastapi import FastAPI, Header, HTTPException
@@ -17,10 +19,64 @@ cipher = Fernet(os.environ["SESSION_ENCRYPTION_KEY"].encode())
 
 app = FastAPI(title="Telegram MTProto Bridge")
 
-# DEVELOPMENT ONLY: sessions are held in memory.
-# Before production/multiple users, replace this with persistent encrypted storage.
+# Render persistent disks should be mounted at /data. Set SESSION_STORE_PATH
+# if a different persistent location is used.
+SESSION_STORE_PATH = os.environ.get("SESSION_STORE_PATH", "/data/telegram_sessions.json")
+LOCAL_SESSION_STORE_PATH = "/tmp/telegram_sessions.json"
+
+# Encrypted Telethon StringSession values are persisted to disk so a Render
+# restart/redeploy can recreate the TelegramClient without another login.
 sessions: Dict[str, str] = {}
 clients: Dict[str, TelegramClient] = {}
+
+
+def _session_store_path() -> str:
+    directory = os.path.dirname(SESSION_STORE_PATH)
+    if directory and os.path.isdir(directory):
+        return SESSION_STORE_PATH
+    return LOCAL_SESSION_STORE_PATH
+
+
+def _load_sessions() -> None:
+    global sessions
+    path = _session_store_path()
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        sessions = {
+            str(user_id): str(value)
+            for user_id, value in data.items()
+            if isinstance(value, str) and value
+        } if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        sessions = {}
+
+
+def _save_sessions() -> None:
+    path = _session_store_path()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".telegram_sessions_",
+        suffix=".tmp",
+        dir=directory or None,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(sessions, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+_load_sessions()
 
 
 class LoginStart(BaseModel):
@@ -55,7 +111,10 @@ async def get_client(user_id: str):
     if not encrypted_session:
         raise HTTPException(status_code=404, detail="Telegram account is not connected")
 
-    session_string = cipher.decrypt(encrypted_session.encode()).decode()
+    try:
+        session_string = cipher.decrypt(encrypted_session.encode()).decode()
+    except Exception:
+        raise HTTPException(status_code=500, detail="Stored Telegram session could not be decrypted")
     client = clients.get(user_id)
 
     if client is None:
@@ -68,12 +127,25 @@ async def get_client(user_id: str):
 
 @app.get("/")
 async def root():
-    return {"status": "online", "service": "Telegram MTProto Bridge"}
+    return {
+        "status": "online",
+        "service": "Telegram MTProto Bridge",
+        "persistent_sessions": True,
+    }
 
 
 @app.post("/telegram/login/start")
 async def login_start(request: LoginStart, x_api_key: str | None = Header(default=None)):
     check_api_key(x_api_key)
+
+    if request.user_id in sessions:
+        try:
+            client = await get_client(request.user_id)
+            if await client.is_user_authorized():
+                return {"status": "already_connected"}
+        except Exception:
+            sessions.pop(request.user_id, None)
+            _save_sessions()
 
     client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
@@ -101,6 +173,7 @@ async def login_verify(request: LoginVerify, x_api_key: str | None = Header(defa
 
     session_string = client.session.save()
     sessions[request.user_id] = cipher.encrypt(session_string.encode()).decode()
+    _save_sessions()
     return {"status": "connected"}
 
 
@@ -339,5 +412,6 @@ async def logout(user_id: str, x_api_key: str | None = Header(default=None)):
     if client:
         await client.log_out()
 
-    sessions.pop(user_id, None)
+sessions.pop(user_id, None)
+    _save_sessions()
     return {"status": "logged_out"}
