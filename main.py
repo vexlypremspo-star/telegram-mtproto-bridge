@@ -557,7 +557,7 @@ async def get_chats(
     check_api_key(x_api_key)
     client = await get_client(user_id)
 
-    requested_limit = None if limit is None else max(1, min(limit, 200))
+    requested_limit = None if limit is None else max(1, min(limit, 5000))
 
     if folder_id is not None:
         if folder_id == 1:
